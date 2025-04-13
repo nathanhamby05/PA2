@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <pthread.h>
+#include <fcntl.h>
 
 #define MAX_EVENTS 64
 #define MESSAGE_SIZE 16
@@ -28,6 +29,56 @@ typedef struct {
     float request_rate;
     struct sockaddr_in server_addr;
 } client_thread_data_t;
+
+int check_server_available(struct sockaddr_in *server_addr) {
+    int test_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (test_sock < 0) {
+        perror("socket creation failed");
+        return 0;
+    }
+
+    // Set timeout
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(test_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // Set to non-blocking for initial check
+    int flags = fcntl(test_sock, F_GETFL, 0);
+    fcntl(test_sock, F_SETFL, flags | O_NONBLOCK);
+
+    char test_buf[MESSAGE_SIZE] = "TEST";
+    
+    // Send test packet
+    if (sendto(test_sock, test_buf, MESSAGE_SIZE, 0,
+              (struct sockaddr *)server_addr, sizeof(*server_addr)) < 0) {
+        close(test_sock);
+        return 0;
+    }
+
+    // Wait for response
+    char response_buf[MESSAGE_SIZE];
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(test_sock, &read_fds);
+
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+
+    int ret = select(test_sock + 1, &read_fds, NULL, NULL, &tv);
+    if (ret <= 0) {
+        close(test_sock);
+        return 0;
+    }
+
+    if (recvfrom(test_sock, response_buf, MESSAGE_SIZE, 0, NULL, NULL) <= 0) {
+        close(test_sock);
+        return 0;
+    }
+
+    close(test_sock);
+    return 1;
+}
 
 void *client_thread_func(void *arg) {
     client_thread_data_t *data = (client_thread_data_t *)arg;
@@ -118,9 +169,20 @@ void *client_thread_func(void *arg) {
 }
 
 void run_client() {
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = inet_addr(server_ip);
+    server_addr.sin_port = htons(server_port);
+
+    // First check if server is available
+    if (!check_server_available(&server_addr)) {
+        fprintf(stderr, "Error: Server is not running at %s:%d\n", server_ip, server_port);
+        exit(EXIT_FAILURE);
+    }
+
     pthread_t threads[num_client_threads];
     client_thread_data_t thread_data[num_client_threads];
-    struct sockaddr_in server_addr;
 
     for (int i = 0; i < num_client_threads; i++) {
         // Create UDP socket
@@ -131,10 +193,6 @@ void run_client() {
         }
 
         // Set up server address
-        memset(&server_addr, 0, sizeof(server_addr));
-        server_addr.sin_family = AF_INET;
-        server_addr.sin_addr.s_addr = inet_addr(server_ip);
-        server_addr.sin_port = htons(server_port);
         memcpy(&thread_data[i].server_addr, &server_addr, sizeof(server_addr));
 
         // Create epoll instance
