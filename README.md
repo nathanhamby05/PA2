@@ -28,3 +28,5 @@ program (see example usage below)<br />
   - “num_client_threads” - The number of client threads to launch.<br />
   - “num_requests” - The number requests that each client thread will send.<br />
 # Analysis <br />
+### Task 1
+When running ```./pa2_binary_task1 client 127.0.0.1 12345 4 1000000``` the results show that now packet loss is exhibited, but when adding more threads such as ```./pa2_binary_task1 client 127.0.0.1 12345 250 100``` packet loss can be noted. This shows that the UDP handling of the packets is overloading the server and losing minor packets. The more packets that are added, the more loss can be seen. When testing this, I recommend not using a high num_request for the sake of time, sending millions of requests.
