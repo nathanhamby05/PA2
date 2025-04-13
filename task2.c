@@ -9,16 +9,16 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #define MAX_EVENTS 64
 #define MAX_PAYLOAD_SIZE 12
 #define DEFAULT_CLIENT_THREADS 4
-#define MAX_CLIENTS 10000          // Increased from 1000 to handle more clients
-#define TIMEOUT_US 100000          // 100ms timeout
-#define MAX_RETRIES 5              // Maximum retransmission attempts
-#define MAX_SEQ 1                  // For stop-and-wait protocol
+#define MAX_CLIENTS 10000
+#define TIMEOUT_US 100000
+#define MAX_RETRIES 5
+#define MAX_SEQ 1
 
-// Global configuration
 char *server_ip = "127.0.0.1";
 int server_port = 12345;
 int num_client_threads = DEFAULT_CLIENT_THREADS;
@@ -36,13 +36,12 @@ typedef struct {
 
 typedef struct {
     uint32_t client_id;
-    uint32_t seq;       // Sequence number (0 or 1)
-    uint32_t ack;       // Acknowledgment number
-    packet info;        // Network layer packet
+    uint32_t seq;
+    uint32_t ack;
+    packet info;
 } frame;
 
 typedef struct {
-    int epoll_fd;
     int socket_fd;
     uint32_t client_id;
     long long total_rtt;
@@ -51,25 +50,23 @@ typedef struct {
     long retransmit_cnt;
     float request_rate;
     struct sockaddr_in server_addr;
+    int server_available;
 } client_thread_data_t;
 
-// Simulate network layer
 void from_network_layer(packet *p) {
     static const char *data = "ABCDEFGHIJKL";
     memcpy(p->data, data, MAX_PAYLOAD_SIZE);
 }
 
-// Physical layer transmission
 int to_physical_layer(int fd, frame *f, struct sockaddr_in *addr) {
     return sendto(fd, f, sizeof(frame), 0, 
-                 (struct sockaddr *)addr, sizeof(*addr));
+                (struct sockaddr *)addr, sizeof(*addr));
 }
 
-// Physical layer reception
 int from_physical_layer(int fd, frame *f, struct sockaddr_in *addr) {
     socklen_t len = sizeof(*addr);
     return recvfrom(fd, f, sizeof(frame), 0, 
-                   (struct sockaddr *)addr, &len);
+                  (struct sockaddr *)addr, &len);
 }
 
 event_type wait_for_event(int fd, int timeout_us) {
@@ -85,7 +82,60 @@ event_type wait_for_event(int fd, int timeout_us) {
     int ret = select(fd + 1, &fds, NULL, NULL, &tv);
     if (ret == 0) return TIMEOUT;
     if (ret > 0) return FRAME_ARRIVAL;
-    return TIMEOUT; // Treat errors as timeout
+    return TIMEOUT;
+}
+
+int check_server_available(struct sockaddr_in *server_addr) {
+    int test_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (test_sock < 0) {
+        perror("socket creation failed");
+        return 0;
+    }
+
+    // Set timeout
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(test_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // Set to non-blocking for initial check
+    int flags = fcntl(test_sock, F_GETFL, 0);
+    fcntl(test_sock, F_SETFL, flags | O_NONBLOCK);
+
+    frame test_frame;
+    test_frame.client_id = 0;
+    test_frame.seq = 0;
+    test_frame.ack = 0;
+
+    // Send test packet
+    if (sendto(test_sock, &test_frame, sizeof(frame), 0,
+              (struct sockaddr *)server_addr, sizeof(*server_addr)) < 0) {
+        close(test_sock);
+        return 0;
+    }
+
+    // Wait for response
+    frame response;
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(test_sock, &read_fds);
+
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+
+    int ret = select(test_sock + 1, &read_fds, NULL, NULL, &tv);
+    if (ret <= 0) {
+        close(test_sock);
+        return 0;
+    }
+
+    if (recvfrom(test_sock, &response, sizeof(frame), 0, NULL, NULL) <= 0) {
+        close(test_sock);
+        return 0;
+    }
+
+    close(test_sock);
+    return 1;
 }
 
 void *sender_thread(void *arg) {
@@ -94,11 +144,15 @@ void *sender_thread(void *arg) {
     packet buffer;
     uint32_t next_frame_to_send = 0;
     struct timeval start, end;
-    
+
+    if (!data->server_available) {
+        data->tx_cnt = num_requests;
+        return NULL;
+    }
+
     while (data->tx_cnt < num_requests) {
         from_network_layer(&buffer);
         
-        // Prepare frame
         s.client_id = data->client_id;
         s.seq = next_frame_to_send;
         s.ack = 0;
@@ -129,10 +183,10 @@ void *sender_thread(void *arg) {
                         acked = 1;
                         gettimeofday(&end, NULL);
                         long long rtt = (end.tv_sec - start.tv_sec) * 1000000LL + 
-                                       (end.tv_usec - start.tv_usec);
+                                      (end.tv_usec - start.tv_usec);
                         data->total_rtt += rtt;
                         data->rx_cnt++;
-                        next_frame_to_send = 1 - next_frame_to_send; // Toggle 0/1
+                        next_frame_to_send = 1 - next_frame_to_send;
                     }
                 }
             } else {
@@ -142,12 +196,11 @@ void *sender_thread(void *arg) {
         
         if (!acked) {
             fprintf(stderr, "Client %u: Max retries reached for seq %u\n",
-                    data->client_id, next_frame_to_send);
+                   data->client_id, next_frame_to_send);
             break;
         }
     }
     
-    // Calculate request rate
     if (data->total_rtt > 0) {
         data->request_rate = (float)data->rx_cnt / (data->total_rtt / 1000000.0);
     }
@@ -171,7 +224,7 @@ void *receiver_thread(void *arg) {
     
     gettimeofday(&start, NULL);
     
-    printf("[SERVER] Ready to receive packets (supports up to %d clients)...\n", MAX_CLIENTS);
+    printf("[SERVER] Ready to receive packets...\n");
     
     while (1) {
         int n = from_physical_layer(sock_fd, &r, &client_addr);
@@ -182,32 +235,35 @@ void *receiver_thread(void *arg) {
             continue;
         }
         
-        total_packets++;
-        uint32_t cid = r.client_id;
-        
-        // Strict bounds checking
-        if (cid == 0 || cid >= MAX_CLIENTS) {
-            fprintf(stderr, "Invalid client ID: %u (max allowed: %d)\n", 
-                   cid, MAX_CLIENTS-1);
+        // Handle test packets (client_id == 0)
+        if (r.client_id == 0) {
+            s.client_id = 0;
+            s.ack = r.seq;
+            sendto(sock_fd, &s, sizeof(frame), 0,
+                  (struct sockaddr *)&client_addr, sizeof(client_addr));
             continue;
         }
         
-        // Periodic logging
+        total_packets++;
+        uint32_t cid = r.client_id;
+        
+        if (cid >= MAX_CLIENTS) {
+            fprintf(stderr, "Invalid client ID: %u\n", cid);
+            continue;
+        }
+        
         if (total_packets % 1000 == 0) {
             gettimeofday(&current, NULL);
             double elapsed = (current.tv_sec - start.tv_sec) + 
                            (current.tv_usec - start.tv_usec) / 1000000.0;
-            printf("[SERVER] Received %ld packets (%.2f pkt/sec) Last from client %u seq %u\n",
-                   total_packets, total_packets/elapsed, cid, r.seq);
+            printf("[SERVER] Received %ld packets (%.2f pkt/sec)\n",
+                  total_packets, total_packets/elapsed);
         }
         
-        // Process frame
         if (r.seq == expected_seq[cid]) {
-            // Deliver to network layer (simulated)
             expected_seq[cid] = 1 - expected_seq[cid];
         }
         
-        // Send ACK
         s.client_id = cid;
         s.ack = r.seq;
         if (to_physical_layer(sock_fd, &s, &client_addr) < 0) {
@@ -220,47 +276,54 @@ void *receiver_thread(void *arg) {
 }
 
 void run_client() {
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = inet_addr(server_ip);
+    server_addr.sin_port = htons(server_port);
+
+    // First check if server is available
+    int server_available = check_server_available(&server_addr);
+    if (!server_available) {
+        fprintf(stderr, "Error: Server is not running at %s:%d\n", server_ip, server_port);
+        exit(EXIT_FAILURE);
+    }
+
     pthread_t threads[num_client_threads];
     client_thread_data_t *thread_data = malloc(num_client_threads * sizeof(client_thread_data_t));
-    struct sockaddr_in server_addr;
     
     if (!thread_data) {
         perror("malloc failed");
         exit(EXIT_FAILURE);
     }
 
-    // Initialize server address
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = inet_addr(server_ip);
-    server_addr.sin_port = htons(server_port);
-    
     for (int i = 0; i < num_client_threads; i++) {
-        // Create UDP socket
         if ((thread_data[i].socket_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
             perror("socket creation failed");
             exit(EXIT_FAILURE);
         }
         
-        // Copy server address
-        memcpy(&thread_data[i].server_addr, &server_addr, sizeof(server_addr));
+        // Set socket timeout
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        setsockopt(thread_data[i].socket_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         
-        // Assign client ID (1 to MAX_CLIENTS-1)
+        memcpy(&thread_data[i].server_addr, &server_addr, sizeof(server_addr));
         thread_data[i].client_id = (i % (MAX_CLIENTS-1)) + 1;
         thread_data[i].total_rtt = 0;
         thread_data[i].tx_cnt = 0;
         thread_data[i].rx_cnt = 0;
         thread_data[i].retransmit_cnt = 0;
         thread_data[i].request_rate = 0.0;
+        thread_data[i].server_available = server_available;
         
-        // Create client thread
         if (pthread_create(&threads[i], NULL, sender_thread, &thread_data[i]) != 0) {
             perror("pthread_create failed");
             exit(EXIT_FAILURE);
         }
     }
     
-    // Collect statistics
     long long total_rtt = 0;
     long total_tx = 0;
     long total_rx = 0;
@@ -275,13 +338,12 @@ void run_client() {
         total_retrans += thread_data[i].retransmit_cnt;
         total_request_rate += thread_data[i].request_rate;
         
-        printf("Client %u: Sent %ld, Received %ld, Retrans %ld, Loss %.2f%%, Rate %.2f/s\n",
-               thread_data[i].client_id,
-               thread_data[i].tx_cnt,
-               thread_data[i].rx_cnt,
-               thread_data[i].retransmit_cnt,
-               (thread_data[i].tx_cnt - thread_data[i].rx_cnt) * 100.0 / thread_data[i].tx_cnt,
-               thread_data[i].request_rate);
+        printf("Client %u: Sent %ld, Received %ld, Retrans %ld, Loss %.2f%%\n",
+              thread_data[i].client_id,
+              thread_data[i].tx_cnt,
+              thread_data[i].rx_cnt,
+              thread_data[i].retransmit_cnt,
+              (thread_data[i].tx_cnt - thread_data[i].rx_cnt) * 100.0 / thread_data[i].tx_cnt);
         
         close(thread_data[i].socket_fd);
     }
@@ -302,29 +364,24 @@ void run_server() {
     struct sockaddr_in server_addr;
     pthread_t receiver_tid;
     
-    // Create UDP socket
     if ((sock_fd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         perror("socket creation failed");
         exit(EXIT_FAILURE);
     }
     
-    // Set up server address
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = inet_addr(server_ip);
     server_addr.sin_port = htons(server_port);
     
-    // Bind socket to address
     if (bind(sock_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("bind failed");
         close(sock_fd);
         exit(EXIT_FAILURE);
     }
     
-    printf("[SERVER] Started on %s:%d (Supports %d clients)\n", 
-           server_ip, server_port, MAX_CLIENTS);
+    printf("[SERVER] Started on %s:%d\n", server_ip, server_port);
     
-    // Start receiver thread
     if (pthread_create(&receiver_tid, NULL, receiver_thread, &sock_fd) != 0) {
         perror("pthread_create failed");
         close(sock_fd);
